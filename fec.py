@@ -13,8 +13,9 @@ class FluxEquilibriumClustering:
         For better clustering, consider k in range [8, 15].
     sigma : Optional[float], default=None
         Gaussian kernel bandwidth for the initial edge weights. If ``None``,
-        infer from data. Recommended: use a fraction of median pairwise distance
-        (e.g., 0.2 * median_distance) for more discriminative weights.
+        infer from data. Recommended: use a fraction of the median
+        pairwise distance (e.g., 0.2 times the median) for more
+        discriminative weights.
     alpha : float, default=0.5
         Fraction of stored flux that can be redistributed at each iteration.
         Higher values (0.5-0.8) promote more aggressive clustering.
@@ -75,8 +76,11 @@ class FluxEquilibriumClustering:
 
         The final labels must be stored in ``self.labels``.
         """
-        # Hint: Start with computing centroid = X.mean(axis=0)
-
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or 0 in X.shape:
+            raise ValueError(
+                "X must be a nonempty 2-D array of shape "
+                "(n_samples, n_features)")
         centroid = X.mean(axis=0)
         # Single observations form their own cluster
         n_points = X.shape[0]
@@ -86,31 +90,53 @@ class FluxEquilibriumClustering:
             self.sinks = np.array([True])
             self.labels = np.array([0], dtype=int)
             return self
-        # Euclidean distance calculated from points to the centroid
-        d = np.linalg.norm(X - centroid, axis=1)
-        # Pairwise distances between observations
-        coordinate_differences = X[:, None, :] - X[None, :, :]
-        pairwise_distances = np.linalg.norm(coordinate_differences, axis=2)
-        # Exclude self-distances and duplicate pairs
-        unique_pairs = pairwise_distances[np.triu_indices(n_points, k=1)]
+        # A nearby point is a stable origin for Gram distances.
+        centered = X - centroid
+        d = np.linalg.norm(centered, axis=1)
+        shifted = X - X[np.argmin(d)]
+        gram = shifted @ shifted.T
+        norms_squared = np.diag(gram)
+        distances_squared = (
+            norms_squared[:, None] + norms_squared[None, :] - 2 * gram)
+        # Cancellation can produce tiny negative squared distances.
+        np.maximum(distances_squared, 0.0, out=distances_squared)
+        np.fill_diagonal(distances_squared, 0.0)
+        # Each unordered pair contributes exactly once to the median.
+        pair_indices = np.triu_indices(n_points, k=1)
+        unique_pairs = np.sqrt(distances_squared[pair_indices])
         sigma = (
             self.sigma
             if self.sigma is not None
             else 0.2 * np.median(unique_pairs))
         if sigma == 0:
             sigma = 1.0
-
-        # Effective number of neighbors
+        # Use a partial selection
         effective_k = min(self.k, n_points - 1)
-        # Do not consider each observation from its own neighborhood
-        distances_for_knn = pairwise_distances.copy()
-        np.fill_diagonal(distances_for_knn, np.inf)
-        # k closest observations for each point
-        neighbor_indices = np.argsort(distances_for_knn, axis=1)[:, :effective_k]
-        # Distances within each observation's neighborhood
-        neighbor_distances = np.take_along_axis(
-            pairwise_distances, neighbor_indices, axis=1)
-        # Apply Gaussian kernel to neighbor-distances
+        np.fill_diagonal(distances_squared, np.inf)
+        neighbor_indices = np.empty((n_points, effective_k), dtype=int)
+        neighbor_distances = np.empty((n_points, effective_k))
+        roundoff = 64 * np.finfo(float).eps
+        largest_squared_norm = norms_squared.max()
+        for i in range(n_points):
+            row = distances_squared[i]
+            candidates = np.argpartition(
+                row, effective_k - 1
+            )[:effective_k]
+            cutoff = row[candidates].max()
+            # Candidates at cutoff that Gram split
+            margin = roundoff * (
+                largest_squared_norm + norms_squared[i] + cutoff)
+            eligible = np.flatnonzero(row <= cutoff + margin)
+            # Recheck only eligible distances without an (n, n, m)
+            # temporary. A stable sort of ascending indices breaks
+            # exact distance ties toward the lowest observation index.
+            exact_distances = np.linalg.norm(
+                X[eligible] - X[i], axis=1)
+            chosen = np.argsort(
+                exact_distances, kind="stable"
+            )[:effective_k]
+            neighbor_indices[i] = eligible[chosen]
+            neighbor_distances[i] = exact_distances[chosen]
         w_ij = np.exp(-(neighbor_distances ** 2) / (sigma ** 2))
         # One observation contributes one unit of flux initially
         flux = np.ones(n_points, dtype=float)
@@ -119,7 +145,10 @@ class FluxEquilibriumClustering:
         # Neighbor's centroid distance compared with its source point
         neighbor_centroid_distances = d[neighbor_indices]
         downhill_mask = neighbor_centroid_distances <= (d[:, None] + tau)
-        # Flux over T-iterations through the graph
+        # Initialize final outgoing flow for the T=0 case.
+        edge_flux = np.zeros_like(w_ij)
+        outgoing_flux = np.zeros(n_points, dtype=float)
+        # Redistribute flux through the graph for T iterations.
         for iteration in range(self.T):
             if iteration == 0 or self.beta == 0:
                 reinforcement = np.ones_like(flux)
@@ -136,16 +165,16 @@ class FluxEquilibriumClustering:
                 adjusted_weights,
                 weight_totals,
                 out=np.zeros_like(adjusted_weights),
-                where=weight_totals > 0
-            )
+                where=weight_totals > 0)
             # Flux movement through each connection
             edge_flux = self.alpha * flux[:, None] * transport_proportions
             # Flux outgoing each observation
             outgoing_flux = edge_flux.sum(axis=1)
-            # Incoming contributions from neighboring observations
-            incoming_flux = np.zeros_like(flux)
-            # Accumulate flux from multiple sources per destination
-            np.add.at(incoming_flux, neighbor_indices, edge_flux)
+            # bincount accumulates contributions to each destination.
+            incoming_flux = np.bincount(
+                neighbor_indices.ravel(),
+                weights=edge_flux.ravel(),
+                minlength=n_points,)
             flux = flux - outgoing_flux + incoming_flux
         # Observations with negligible outgoing flux
         sinks = outgoing_flux < self.epsilon
@@ -162,7 +191,6 @@ class FluxEquilibriumClustering:
         strongest_connection = np.argmax(edge_flux, axis=1)
         steepest_neighbor = neighbor_indices[
             np.arange(n_points), strongest_connection]
-
         # Trace observations toward a sink
         for start in range(n_points):
             if labels[start] != -1:
@@ -187,7 +215,6 @@ class FluxEquilibriumClustering:
                 cluster_label = labels[path[-1]]
             for observation in path:
                 labels[observation] = cluster_label
-
         # Min cluster size
         min_cluster_size = max(2, n_points // 20)
         # Count observations in clusters

@@ -77,7 +77,6 @@ class FluxEquilibriumClustering:
         """
         # Hint: Start with computing centroid = X.mean(axis=0)
 
-        # Computing global centroid
         centroid = X.mean(axis=0)
         # Single observations form their own cluster
         n_points = X.shape[0]
@@ -111,7 +110,7 @@ class FluxEquilibriumClustering:
         # Distances within each observation's neighborhood
         neighbor_distances = np.take_along_axis(
             pairwise_distances, neighbor_indices, axis=1)
-        # Euclidean distances into Gaussian edge weights
+        # Apply Gaussian kernel to neighbor-distances
         w_ij = np.exp(-(neighbor_distances ** 2) / (sigma ** 2))
         # One observation contributes one unit of flux initially
         flux = np.ones(n_points, dtype=float)
@@ -120,7 +119,7 @@ class FluxEquilibriumClustering:
         # Neighbor's centroid distance compared with its source point
         neighbor_centroid_distances = d[neighbor_indices]
         downhill_mask = neighbor_centroid_distances <= (d[:, None] + tau)
-        # Redistribute flux over T iterations through the graph + influence on neighboring edges
+        # Flux over T-iterations through the graph
         for iteration in range(self.T):
             if iteration == 0 or self.beta == 0:
                 reinforcement = np.ones_like(flux)
@@ -145,13 +144,12 @@ class FluxEquilibriumClustering:
             outgoing_flux = edge_flux.sum(axis=1)
             # Incoming contributions from neighboring observations
             incoming_flux = np.zeros_like(flux)
+            # Accumulate flux from multiple sources per destination
             np.add.at(incoming_flux, neighbor_indices, edge_flux)
-            # Update
             flux = flux - outgoing_flux + incoming_flux
         # Observations with negligible outgoing flux
         sinks = outgoing_flux < self.epsilon
-        # One sink (min) exists
-        if not np.any(sinks):
+        # Select closest point to centroid if no sinks found        if not np.any(sinks):
             closest_to_centroid = np.argmin(d)
             sinks[closest_to_centroid] = True
         # Start assignments for clustering
@@ -197,7 +195,7 @@ class FluxEquilibriumClustering:
         # ID clusters to receive smaller clusters
         large_clusters = cluster_ids[
             cluster_sizes >= min_cluster_size]
-        # Threshhold not met
+        # Threshhold size not met = use largest cluster
         if len(large_clusters) == 0:
             large_clusters = np.array([
                 cluster_ids[np.argmax(cluster_sizes)]])

@@ -149,7 +149,8 @@ class FluxEquilibriumClustering:
             flux = flux - outgoing_flux + incoming_flux
         # Observations with negligible outgoing flux
         sinks = outgoing_flux < self.epsilon
-        # Select closest point to centroid if no sinks found        if not np.any(sinks):
+        # Select closest point to centroid if no sinks found
+        if not np.any(sinks):
             closest_to_centroid = np.argmin(d)
             sinks[closest_to_centroid] = True
         # Start assignments for clustering

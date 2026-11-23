@@ -137,7 +137,8 @@ class FluxEquilibriumClustering:
             )[:effective_k]
             neighbor_indices[i] = eligible[chosen]
             neighbor_distances[i] = exact_distances[chosen]
-        w_ij = np.exp(-(neighbor_distances ** 2) / (sigma ** 2))
+        log_w_ij = -(neighbor_distances / sigma) ** 2
+        w_ij = np.exp(log_w_ij)
         # One observation contributes one unit of flux initially
         flux = np.ones(n_points, dtype=float)
         # Tolerance for determining downhill connections
@@ -157,8 +158,13 @@ class FluxEquilibriumClustering:
             else:
                 reinforcement = flux ** self.beta
             # Eligible connections using destination-node flux
-            adjusted_weights = w_ij * reinforcement[neighbor_indices]
-            adjusted_weights *= downhill_mask
+            with np.errstate(divide="ignore"):
+                log_weights = log_w_ij + np.log(reinforcement)[neighbor_indices]
+
+            log_weights = np.where(downhill_mask, log_weights, -np.inf)
+            row_max = log_weights.max(axis=1, keepdims=True)
+            row_max[~np.isfinite(row_max)] = 0.0
+            adjusted_weights = np.exp(log_weights - row_max)
             # Normalize each node's outgoing connections
             weight_totals = adjusted_weights.sum(axis=1, keepdims=True)
             transport_proportions = np.divide(
@@ -175,7 +181,12 @@ class FluxEquilibriumClustering:
                 neighbor_indices.ravel(),
                 weights=edge_flux.ravel(),
                 minlength=n_points,)
-            flux = flux - outgoing_flux + incoming_flux
+            retained_flux = np.where(
+                weight_totals[:, 0] > 0,
+                (1.0 - self.alpha) * flux,
+                flux
+            )
+            flux = retained_flux + incoming_flux
         # Observations with negligible outgoing flux
         sinks = outgoing_flux < self.epsilon
         # Select closest point to centroid if no sinks found
@@ -201,7 +212,7 @@ class FluxEquilibriumClustering:
             while labels[current] == -1:
                 # Stop if path loops to a visited observation
                 if current in visited:
-                    cycle_sink = path[-1]
+                    cycle_sink = current
                     labels[cycle_sink] = labels.max() + 1
                     sinks[cycle_sink] = True
                     break
@@ -223,17 +234,13 @@ class FluxEquilibriumClustering:
         # ID clusters to receive smaller clusters
         large_clusters = cluster_ids[
             cluster_sizes >= min_cluster_size]
-        # Threshhold size not met = use largest cluster
-        if len(large_clusters) == 0:
-            large_clusters = np.array([
-                cluster_ids[np.argmax(cluster_sizes)]])
         # Calculate centroids of larger clusters
         large_centroids = np.array([
             X[labels == cluster_id].mean(axis=0)
             for cluster_id in large_clusters])
         # Merge small clusters into their nearest larger cluster
         for cluster_id, cluster_size in zip(cluster_ids, cluster_sizes):
-            if cluster_id in large_clusters:
+            if large_clusters.size == 0 or cluster_id in large_clusters:
                 continue
             small_centroid = X[labels == cluster_id].mean(axis=0)
             distances_to_large = np.linalg.norm(
